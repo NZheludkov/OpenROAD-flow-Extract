@@ -164,80 +164,31 @@ def finalize_net(current: dict, units: SpefUnits) -> dict:
     return row
 
 
-def parse_spef_nets(spef_path: Path) -> Iterator[dict]:
+def parse_spef_total_caps(spef_path: Path) -> Iterator[dict]:
     units, name_map = parse_spef_header_and_namemap(spef_path)
-
-    current: Optional[dict] = None
-    section: Optional[str] = None
 
     with spef_path.open("r", errors="ignore") as f:
         for line in f:
             line = line.strip()
 
-            if not line:
+            if not line.startswith("*D_NET"):
                 continue
 
-            if line.startswith("*D_NET"):
-                if current is not None:
-                    yield finalize_net(current, units)
-
-                parts = line.split()
-                if len(parts) < 3:
-                    current = None
-                    section = None
-                    continue
-
-                net_token = parts[1]
-                total_cap_raw = float(parts[2])
-
-                current = {
-                    "net_name_spef": net_token,
-                    "net_name": resolve_name(net_token, name_map),
-                    "cap_total_raw": total_cap_raw,
-                    "ground_cap_raw": 0.0,
-                    "coupling_cap_raw": 0.0,
-                    "res_total_raw": 0.0,
-                    "num_cap_entries": 0,
-                    "num_ground_cap_entries": 0,
-                    "num_coupling_cap_entries": 0,
-                    "num_res_entries": 0,
-                }
-                section = None
+            parts = line.split()
+            if len(parts) < 3:
                 continue
 
-            if current is None:
-                continue
+            net_token = parts[1]
+            cap_total_raw = float(parts[2])
 
-            if line.startswith("*CONN"):
-                section = "CONN"
-                continue
-
-            if line.startswith("*CAP"):
-                section = "CAP"
-                continue
-
-            if line.startswith("*RES"):
-                section = "RES"
-                continue
-
-            if line.startswith("*END"):
-                yield finalize_net(current, units)
-                current = None
-                section = None
-                continue
-
-            if section == "CAP":
-                parse_cap_line(line, current)
-
-            elif section == "RES":
-                parse_res_line(line, current)
-
-    if current is not None:
-        yield finalize_net(current, units)
+            yield {
+                "net_name": resolve_name(net_token, name_map),
+                "cap_total_ff": cap_total_raw * units.cap_to_ff,
+            }
 
 
 def extract_spef_to_dataframe(spef_path: Path) -> pd.DataFrame:
-    rows = list(parse_spef_nets(spef_path))
+    rows = list(parse_spef_total_caps(spef_path))
     return pd.DataFrame(rows)
 
 
@@ -373,13 +324,20 @@ def write_output(df: pd.DataFrame, out_file: Path) -> None:
     out_file.parent.mkdir(parents=True, exist_ok=True)
 
     suffix = out_file.suffix.lower()
+    tmp_file = out_file.with_name(out_file.name + ".tmp")
 
     if suffix == ".parquet":
-        df.to_parquet(out_file, index=False)
+        df.to_parquet(tmp_file, index=False, engine="pyarrow")
     elif suffix == ".csv":
-        df.to_csv(out_file, index=False)
+        df.to_csv(tmp_file, index=False)
     else:
         raise ValueError("Unsupported output format. Use .parquet or .csv")
+
+    # Проверяем, что файл реально читается
+    if suffix == ".parquet":
+        pd.read_parquet(tmp_file, engine="pyarrow")
+
+    tmp_file.replace(out_file)
 
 
 def extract_dataset(dataset_path: Path, out_file: Path, report_file: Optional[Path]) -> None:
