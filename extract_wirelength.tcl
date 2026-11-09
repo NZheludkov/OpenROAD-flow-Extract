@@ -1,5 +1,30 @@
 ##EXTRACT NETS WIRELENGTH and FEATURES
 
+proc add_wirelength_to_dict {dict_var report_file} {
+    upvar 1 $dict_var dict_nets
+
+    set fp [open $report_file r]
+    set count 0
+
+    while {[gets $fp line] >= 0} {
+        if {![regexp {^drt:\s+(\S+)\s+(\S+)\s+\d+} $line -> net wl]} {
+            continue
+        }
+
+        # Remove escaping from bus indices: \[ -> [, \] -> ]
+        set net [string map [list "\\\[" "\[" "\\\]" "\]"] $net]
+
+        if {[dict exists $dict_nets $net]} {
+            dict set dict_nets $net wirelength $wl
+            incr count
+        }
+    }
+
+    close $fp
+
+    puts "Wirelength added for $count nets"
+}
+
 # Gets full name list
 proc get_full_name_list {list} {
 	set new_list ""
@@ -47,6 +72,48 @@ proc get_net_driver {net_name} {
   return ""
 }
 
+proc save_nets_csv {filename} {
+    global dict_nets
+
+    if {[dict size $dict_nets] == 0} {
+        puts stderr "dict_nets пуст — нечего записывать"
+        return
+    }
+
+    # --- 1. Собираем все имена атрибутов (объединение ключей) ---
+    set attrSet [dict create]
+    dict for {name params} $dict_nets {
+        dict for {attr val} $params {
+            dict set attrSet $attr 1
+        }
+    }
+    # стабильный порядок колонок; при желании можно задать свой список
+    set attrs [lsort [dict keys $attrSet]]
+
+    # --- 2. Открываем файл и пишем заголовок ---
+    if {[catch {open $filename w} fp]} {
+        error "Не удалось открыть '$filename': $fp"
+    }
+    puts $fp "net,[join $attrs ,]"
+
+    # --- 3. Пишем данные ---
+    foreach name [lsort [dict keys $dict_nets]] {
+        set params [dict get $dict_nets $name]
+        set row [list $name]
+        foreach attr $attrs {
+            if {[dict exists $params $attr]} {
+                lappend row [dict get $params $attr]
+            } else {
+                lappend row ""        ;# отсутствующий атрибут -> пустая ячейка
+            }
+        }
+        puts $fp [join $row ,]
+    }
+
+    close $fp
+    puts "Записано [dict size $dict_nets] строк, колонок: [expr {[llength $attrs]+1}]"
+}
+
 #round
 proc tcl::mathfunc::roundto {value sigfigs} {
 
@@ -73,7 +140,8 @@ proc tcl::mathfunc::roundto {value sigfigs} {
 set db [::ord::get_db]
 set block [[$db getChips] getBlock]
 set db_units_per_micron [expr double([$block getDbUnitsPerMicron])]
-set corner [lindex [sta::corners] 0]
+#set corner [lindex [sta::corners] 0]
+set corner "view"
 
 set block_llx [expr [[$block getBBox] xMin] / $db_units_per_micron]
 set block_lly [expr [[$block getBBox] yMin] / $db_units_per_micron]
@@ -98,7 +166,7 @@ foreach net [ get_full_name_list [get_nets -filter "name != VDD && name != VSS"]
 	dict set dict_nets $net "terms" [$net_odb_name getTermCount]
 
  	#net is port (1 - true; 0 - false)
-  	if {[get_ports $net] ne ""} {
+  	if {[get_ports -quiet $net] ne ""} {
     	set is_port 1
     	dict set dict_nets $net is_port $is_port
     	set port_direction [get_property -object_type port $net direction]
@@ -202,140 +270,18 @@ foreach net [ get_full_name_list [get_nets -filter "name != VDD && name != VSS"]
     	dict set dict_nets $net "fanout_area" "0"
   	}
 
-  	#get real wirelength of net
-  	with_output_to_variable a {global net; report_wire_length -net $net}
-  	set wirelength [string trimright [lindex $a 8] "um"]
-  	dict set dict_nets $net "wirelength" $wirelength
-
 }
 
+##report nets wirelnegth to file
+report_wire_length -detailed_route -net [ get_full_name_list [get_nets -filter "name != VDD && name != VSS"] ] -file report.txt > ./report.txt
 
+##add nets wirelength to dictionary
+add_wirelength_to_dict dict_nets report.txt
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-if {0} {
-
-report_wire_length -detailed_route -net [ get_full_name_list [get_nets -filter "name != VDD && name != VSS"] ] -file ./wirelength.txt
-
-sed -i.bak 's/\\\[/[/g; s/\\\]/]/g' file.txt
-
-proc load_nets {filename} {
-    global dict_nets
-    #set dict_nets [dict create]
-
-    if {[catch {open $filename r} fp]} {
-        error "Не удалось открыть файл '$filename': $fp"
-    }
-
-    set lineNum 0
-    while {[gets $fp line] >= 0} {
-        incr lineNum
-        set line [string trim $line]
-
-        # пропускаем пустые строки и комментарии
-        if {$line eq "" || [string match "#*" $line]} continue
-
-        # разбиваем по пробелам/табам
-        set tokens [regexp -all -inline {\S+} $line]
-        if {[llength $tokens] < 3} {
-            puts stderr "Строка $lineNum пропущена (мало полей): $line"
-            continue
-        }
-
-        set name   [lindex $tokens 1]   ;# _209_, _210_ ...
-        set length [lindex $tokens 2]   ;# 4.75, 5.2 ...
-
-        # проверка, что длина — число
-        if {![string is double -strict $length]} {
-            puts stderr "Строка $lineNum: длина '$length' не число — пропуск"
-            continue
-        }
-
-        # (необязательно) убрать подчёркивания: _209_ -> 209
-        # set name [string trim $name "_"]
-
-        dict set dict_nets $name "wirelength" $length
-    }
-    close $fp
-
-    return $dict_nets
-}
-
-proc save_nets_csv {filename} {
-    global dict_nets
-
-    if {[dict size $dict_nets] == 0} {
-        puts stderr "dict_nets пуст — нечего записывать"
-        return
-    }
-
-    # --- 1. Собираем все имена атрибутов (объединение ключей) ---
-    set attrSet [dict create]
-    dict for {name params} $dict_nets {
-        dict for {attr val} $params {
-            dict set attrSet $attr 1
-        }
-    }
-    # стабильный порядок колонок; при желании можно задать свой список
-    set attrs [lsort [dict keys $attrSet]]
-
-    # --- 2. Открываем файл и пишем заголовок ---
-    if {[catch {open $filename w} fp]} {
-        error "Не удалось открыть '$filename': $fp"
-    }
-    puts $fp "net,[join $attrs ,]"
-
-    # --- 3. Пишем данные ---
-    foreach name [lsort [dict keys $dict_nets]] {
-        set params [dict get $dict_nets $name]
-        set row [list $name]
-        foreach attr $attrs {
-            if {[dict exists $params $attr]} {
-                lappend row [dict get $params $attr]
-            } else {
-                lappend row ""        ;# отсутствующий атрибут -> пустая ячейка
-            }
-        }
-        puts $fp [join $row ,]
-    }
-
-    close $fp
-    puts "Записано [dict size $dict_nets] строк, колонок: [expr {[llength $attrs]+1}]"
-}
-
-
-#nets feat
-
-set db [::ord::get_db]
-set block [[$db getChips] getBlock]
-set db_units_per_micron [expr double([$block getDbUnitsPerMicron])]
-
-#nets fanout
-foreach net [get_nets -filter "name != VDD && name != VSS"] {
-
-	set full_name [get_full_name $net]
-	set fanout [[sta::sta_to_db_net $net] getTermCount]
-	set net_odb_name [sta::sta_to_db_net [get_nets $net]]
-	dict set dict_nets $full_name "fanout" $fanout
-	dict set dict_nets $full_name "hpwl" [expr roundto(([[$net_odb_name getTermBBox] dx] + [[$net_odb_name getTermBBox] dy]) / $db_units_per_micron,3)]
-
-}
-
-load_nets ./wirelength.txt
+##write nets to csv
 
 save_nets_csv "nets.csv" 
 
-}
+
+
+

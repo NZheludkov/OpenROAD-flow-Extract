@@ -31,10 +31,556 @@ REQUIRED_OUTPUT_COLUMNS = [
 ]
 
 
+FEATURE_TCL = r'''
+# ============================================================
+# Embedded Tcl feature extractor
+#
+# Extracts net-level features from loaded OpenROAD design.
+#
+# Required design state:
+#   - LEF loaded
+#   - postCTS DEF loaded
+#   - Liberty loaded with corner "view"
+#   - SDC loaded
+#
+# Output columns:
+#   design,pdk_name,config_id,net_name,
+#   fanin,fanout,fanin_area,fanout_area,
+#   hpwl,cell_density,pin_cap_ff,gcell_area,gcell_ar
+# ============================================================
+
+if {![info exists DENSITY_BIN_UM]} {
+    set DENSITY_BIN_UM 10.0
+}
+
+if {![info exists SKIP_MULTI_DRIVER_NETS]} {
+    set SKIP_MULTI_DRIVER_NETS 1
+}
+
+if {![info exists SKIP_NON_CELL_NETS]} {
+    set SKIP_NON_CELL_NETS 1
+}
+
+
+proc is_null {obj} {
+    return [expr {$obj eq "" || $obj eq "NULL" || $obj eq "0"}]
+}
+
+
+proc csv_escape {s} {
+    set s [string map {\" \"\"} $s]
+    return "\"$s\""
+}
+
+
+proc inst_box {inst} {
+    set box [$inst getBBox]
+    return [list [$box xMin] [$box yMin] [$box xMax] [$box yMax]]
+}
+
+
+proc inst_area_um2 {inst dbu} {
+    lassign [inst_box $inst] xmin ymin xmax ymax
+
+    set w_um [expr {double($xmax - $xmin) / double($dbu)}]
+    set h_um [expr {double($ymax - $ymin) / double($dbu)}]
+
+    if {$w_um <= 0.0 || $h_um <= 0.0} {
+        return 0.0
+    }
+
+    return [expr {$w_um * $h_um}]
+}
+
+
+proc mterm_direction {iterm} {
+    set mterm [$iterm getMTerm]
+
+    if {[is_null $mterm]} {
+        return ""
+    }
+
+    return [$mterm getIoType]
+}
+
+
+proc is_signal_net {net} {
+    if {[is_null $net]} {
+        return 0
+    }
+
+    if {[catch {set sig_type [$net getSigType]}]} {
+        return 1
+    }
+
+    if {$sig_type eq "POWER" || $sig_type eq "GROUND"} {
+        return 0
+    }
+
+    return 1
+}
+
+
+proc get_net_cell_drivers_and_loads {net} {
+    set drivers {}
+    set loads {}
+
+    foreach iterm [$net getITerms] {
+        set inst [$iterm getInst]
+
+        if {[is_null $inst]} {
+            continue
+        }
+
+        set dir [mterm_direction $iterm]
+
+        if {$dir eq "OUTPUT"} {
+            lappend drivers $iterm
+        } elseif {$dir eq "INPUT"} {
+            lappend loads $iterm
+        } elseif {$dir eq "INOUT"} {
+            lappend loads $iterm
+        }
+    }
+
+    return [list $drivers $loads]
+}
+
+
+proc get_driver_input_nets {driver_inst driven_net} {
+    set input_nets [dict create]
+    set driven_net_name [$driven_net getName]
+
+    foreach iterm [$driver_inst getITerms] {
+        set dir [mterm_direction $iterm]
+
+        if {$dir ne "INPUT"} {
+            continue
+        }
+
+        set net [$iterm getNet]
+
+        if {[is_null $net]} {
+            continue
+        }
+
+        if {![is_signal_net $net]} {
+            continue
+        }
+
+        set net_name [$net getName]
+
+        if {$net_name eq $driven_net_name} {
+            continue
+        }
+
+        dict set input_nets $net_name $net
+    }
+
+    set result {}
+
+    dict for {net_name net_obj} $input_nets {
+        lappend result $net_obj
+    }
+
+    return $result
+}
+
+
+proc get_upstream_driver_insts {input_nets} {
+    set upstream_insts [dict create]
+
+    foreach in_net $input_nets {
+        lassign [get_net_cell_drivers_and_loads $in_net] drivers loads
+
+        foreach driver_iterm $drivers {
+            set inst [$driver_iterm getInst]
+
+            if {[is_null $inst]} {
+                continue
+            }
+
+            dict set upstream_insts [$inst getName] $inst
+        }
+    }
+
+    set result {}
+
+    dict for {inst_name inst_obj} $upstream_insts {
+        lappend result $inst_obj
+    }
+
+    return $result
+}
+
+
+proc unique_insts_from_iterms {iterms} {
+    set inst_dict [dict create]
+
+    foreach iterm $iterms {
+        set inst [$iterm getInst]
+
+        if {[is_null $inst]} {
+            continue
+        }
+
+        dict set inst_dict [$inst getName] $inst
+    }
+
+    set result {}
+
+    dict for {name inst} $inst_dict {
+        lappend result $inst
+    }
+
+    return $result
+}
+
+
+proc sum_unique_inst_area_um2 {insts dbu} {
+    set seen [dict create]
+    set area 0.0
+
+    foreach inst $insts {
+        if {[is_null $inst]} {
+            continue
+        }
+
+        set inst_name [$inst getName]
+
+        if {[dict exists $seen $inst_name]} {
+            continue
+        }
+
+        dict set seen $inst_name 1
+
+        set area [expr {$area + [inst_area_um2 $inst $dbu]}]
+    }
+
+    return $area
+}
+
+
+proc bbox_from_insts {insts} {
+    set first 1
+
+    set xmin 0
+    set ymin 0
+    set xmax 0
+    set ymax 0
+
+    foreach inst $insts {
+        if {[is_null $inst]} {
+            continue
+        }
+
+        lassign [inst_box $inst] ixmin iymin ixmax iymax
+
+        if {$first} {
+            set xmin $ixmin
+            set ymin $iymin
+            set xmax $ixmax
+            set ymax $iymax
+            set first 0
+        } else {
+            if {$ixmin < $xmin} {
+                set xmin $ixmin
+            }
+            if {$iymin < $ymin} {
+                set ymin $iymin
+            }
+            if {$ixmax > $xmax} {
+                set xmax $ixmax
+            }
+            if {$iymax > $ymax} {
+                set ymax $iymax
+            }
+        }
+    }
+
+    if {$first} {
+        return ""
+    }
+
+    return [list $xmin $ymin $xmax $ymax]
+}
+
+
+proc hpwl_from_bbox_um {bbox dbu} {
+    lassign $bbox xmin ymin xmax ymax
+
+    set w_um [expr {double($xmax - $xmin) / double($dbu)}]
+    set h_um [expr {double($ymax - $ymin) / double($dbu)}]
+
+    return [expr {$w_um + $h_um}]
+}
+
+
+proc area_from_bbox_um2 {bbox dbu} {
+    lassign $bbox xmin ymin xmax ymax
+
+    set w_um [expr {double($xmax - $xmin) / double($dbu)}]
+    set h_um [expr {double($ymax - $ymin) / double($dbu)}]
+
+    if {$w_um <= 0.0 || $h_um <= 0.0} {
+        return 0.0
+    }
+
+    return [expr {$w_um * $h_um}]
+}
+
+
+proc ar_from_bbox {bbox} {
+    lassign $bbox xmin ymin xmax ymax
+
+    set w [expr {double($xmax - $xmin)}]
+    set h [expr {double($ymax - $ymin)}]
+
+    if {$h <= 0.0} {
+        return 0.0
+    }
+
+    return [expr {$w / $h}]
+}
+
+
+proc build_density_bins {block dbu bin_um} {
+    global DENSITY_BIN_DBU
+    global CELL_DENSITY_BIN_AREA
+
+    catch {array unset CELL_DENSITY_BIN_AREA}
+
+    set DENSITY_BIN_DBU [expr {int(double($bin_um) * double($dbu))}]
+
+    if {$DENSITY_BIN_DBU < 1} {
+        set DENSITY_BIN_DBU 1
+    }
+
+    foreach inst [$block getInsts] {
+        if {[is_null $inst]} {
+            continue
+        }
+
+        if {[catch {lassign [inst_box $inst] xmin ymin xmax ymax}]} {
+            continue
+        }
+
+        set cx [expr {int(($xmin + $xmax) / 2)}]
+        set cy [expr {int(($ymin + $ymax) / 2)}]
+
+        set bx [expr {int(floor(double($cx) / double($DENSITY_BIN_DBU)))}]
+        set by [expr {int(floor(double($cy) / double($DENSITY_BIN_DBU)))}]
+
+        set key "$bx,$by"
+
+        set area_um2 [inst_area_um2 $inst $dbu]
+
+        if {![info exists CELL_DENSITY_BIN_AREA($key)]} {
+            set CELL_DENSITY_BIN_AREA($key) 0.0
+        }
+
+        set CELL_DENSITY_BIN_AREA($key) [expr {$CELL_DENSITY_BIN_AREA($key) + $area_um2}]
+    }
+}
+
+
+proc cell_density_in_bbox {bbox dbu} {
+    global DENSITY_BIN_DBU
+    global CELL_DENSITY_BIN_AREA
+
+    lassign $bbox xmin ymin xmax ymax
+
+    set bbox_area_um2 [area_from_bbox_um2 $bbox $dbu]
+
+    if {$bbox_area_um2 <= 0.0} {
+        return 0.0
+    }
+
+    set bx0 [expr {int(floor(double($xmin) / double($DENSITY_BIN_DBU)))}]
+    set by0 [expr {int(floor(double($ymin) / double($DENSITY_BIN_DBU)))}]
+    set bx1 [expr {int(floor(double($xmax) / double($DENSITY_BIN_DBU)))}]
+    set by1 [expr {int(floor(double($ymax) / double($DENSITY_BIN_DBU)))}]
+
+    set cell_area_sum_um2 0.0
+
+    for {set bx $bx0} {$bx <= $bx1} {incr bx} {
+        for {set by $by0} {$by <= $by1} {incr by} {
+            set key "$bx,$by"
+
+            if {[info exists CELL_DENSITY_BIN_AREA($key)]} {
+                set cell_area_sum_um2 [expr {$cell_area_sum_um2 + $CELL_DENSITY_BIN_AREA($key)}]
+            }
+        }
+    }
+
+    return [expr {$cell_area_sum_um2 / $bbox_area_um2}]
+}
+
+
+proc get_net_pin_cap_ff {net_name} {
+    # Correct OpenROAD/OpenSTA method found experimentally:
+    #
+    #   set sta_net [get_nets _1925_]
+    #   $sta_net pin_capacitance view max
+    #
+    # Returned value is in farads.
+    # Convert to femtofarads: 1 F = 1e15 fF.
+
+    set sta_nets ""
+
+    if {[catch {set sta_nets [get_nets -quiet $net_name]}]} {
+        if {[catch {set sta_nets [get_nets $net_name]}]} {
+            return 0.0
+        }
+    }
+
+    if {[llength $sta_nets] == 0} {
+        return 0.0
+    }
+
+    set sta_net [lindex $sta_nets 0]
+
+    if {![catch {set cap_f [$sta_net pin_capacitance view max]}]} {
+        if {$cap_f ne ""} {
+            return [expr {double($cap_f) * 1.0e15}]
+        }
+    }
+
+    return 0.0
+}
+
+
+proc extract_net_features_postcts {out_csv} {
+    global DENSITY_BIN_UM
+    global SKIP_MULTI_DRIVER_NETS
+    global SKIP_NON_CELL_NETS
+
+    set block [ord::get_db_block]
+    set dbu [$block getDbUnitsPerMicron]
+
+    puts "Building density bins..."
+    build_density_bins $block $dbu $DENSITY_BIN_UM
+    puts "Density bins are ready."
+
+    if {[info exists ::design]} {
+        set design_name $::design
+    } else {
+        set design_name "unknown_design"
+    }
+
+    if {[info exists ::pdk_name]} {
+        set pdk_name $::pdk_name
+    } else {
+        set pdk_name "unknown_pdk"
+    }
+
+    if {[info exists ::run_dir]} {
+        set config_id [file tail $::run_dir]
+    } else {
+        set config_id "unknown_config"
+    }
+
+    set fh [open $out_csv "w"]
+
+    puts $fh "design,pdk_name,config_id,net_name,fanin,fanout,fanin_area,fanout_area,hpwl,cell_density,pin_cap_ff,gcell_area,gcell_ar"
+
+    set total_nets 0
+    set written_nets 0
+    set skipped_nets 0
+
+    foreach net [$block getNets] {
+        incr total_nets
+
+        if {![is_signal_net $net]} {
+            incr skipped_nets
+            continue
+        }
+
+        set net_name [$net getName]
+
+        lassign [get_net_cell_drivers_and_loads $net] driver_iterms load_iterms
+
+        set num_drivers [llength $driver_iterms]
+        set num_loads [llength $load_iterms]
+
+        if {$SKIP_NON_CELL_NETS && ($num_drivers == 0 || $num_loads == 0)} {
+            incr skipped_nets
+            continue
+        }
+
+        if {$SKIP_MULTI_DRIVER_NETS && $num_drivers != 1} {
+            incr skipped_nets
+            continue
+        }
+
+        if {$num_drivers == 0} {
+            incr skipped_nets
+            continue
+        }
+
+        set driver_iterm [lindex $driver_iterms 0]
+        set driver_inst [$driver_iterm getInst]
+
+        if {[is_null $driver_inst]} {
+            incr skipped_nets
+            continue
+        }
+
+        # fanin: number of unique signal input nets of driver cell
+        set input_nets [get_driver_input_nets $driver_inst $net]
+        set fanin [llength $input_nets]
+
+        # fanout: number of cell load pins
+        set fanout $num_loads
+
+        # fanin_area: area of upstream driver cells
+        set upstream_driver_insts [get_upstream_driver_insts $input_nets]
+        set fanin_area [sum_unique_inst_area_um2 $upstream_driver_insts $dbu]
+
+        # fanout_area: area of unique load cells
+        set load_insts [unique_insts_from_iterms $load_iterms]
+        set fanout_area [sum_unique_inst_area_um2 $load_insts $dbu]
+
+        # HPWL bbox based on driver cell and load cells
+        set hpwl_insts [concat [list $driver_inst] $load_insts]
+        set bbox [bbox_from_insts $hpwl_insts]
+
+        if {$bbox eq ""} {
+            incr skipped_nets
+            continue
+        }
+
+        set hpwl [hpwl_from_bbox_um $bbox $dbu]
+        set gcell_area [area_from_bbox_um2 $bbox $dbu]
+        set gcell_ar [ar_from_bbox $bbox]
+
+        set cell_density [cell_density_in_bbox $bbox $dbu]
+
+        # Correct net pin capacitance from OpenSTA/OpenROAD, in fF.
+        set pin_cap_ff [get_net_pin_cap_ff $net_name]
+
+        puts $fh "[csv_escape $design_name],[csv_escape $pdk_name],[csv_escape $config_id],[csv_escape $net_name],$fanin,$fanout,$fanin_area,$fanout_area,$hpwl,$cell_density,$pin_cap_ff,$gcell_area,$gcell_ar"
+
+        incr written_nets
+    }
+
+    close $fh
+
+    puts "Feature extraction complete."
+    puts "Total nets   : $total_nets"
+    puts "Written nets : $written_nets"
+    puts "Skipped nets : $skipped_nets"
+    puts "Output CSV   : $out_csv"
+}
+'''
+
+
+def tcl_quote(path: Path | str) -> str:
+    s = str(path)
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
 def find_run_dirs(dataset_path: Path) -> list[Path]:
-    """
-    A run directory is detected by config/config.tcl.
-    """
     config_files = sorted(dataset_path.rglob("config/config.tcl"))
     return [cfg.parent.parent for cfg in config_files]
 
@@ -51,10 +597,12 @@ def find_postcts_def(run_dir: Path) -> Optional[Path]:
             return cand
 
     postcts_dir = run_dir / "postcts"
+
     if not postcts_dir.exists():
         return None
 
     defs = sorted(postcts_dir.rglob("*.def"))
+
     if not defs:
         return None
 
@@ -73,10 +621,12 @@ def find_postcts_sdc(run_dir: Path) -> Optional[Path]:
             return cand
 
     postcts_dir = run_dir / "postcts"
+
     if not postcts_dir.exists():
         return None
 
     sdcs = sorted(postcts_dir.rglob("*.sdc"))
+
     if not sdcs:
         return None
 
@@ -84,49 +634,40 @@ def find_postcts_sdc(run_dir: Path) -> Optional[Path]:
 
 
 def make_output_run_dir(dataset_path: Path, out_dir: Path, run_dir: Path) -> Path:
-    rel = run_dir.relative_to(dataset_path)
-    return out_dir / rel
+    return out_dir / run_dir.relative_to(dataset_path)
 
 
-def output_is_complete(out_file: Path) -> bool:
-    return out_file.exists() and out_file.stat().st_size > 0
+def output_is_complete(parquet_file: Path) -> bool:
+    return parquet_file.exists() and parquet_file.stat().st_size > 0
 
 
 def make_tcl_script(
     config_file: Path,
     def_file: Path,
     sdc_file: Path,
-    feat_tcl: Path,
     csv_file: Path,
     tcl_file: Path,
     density_bin_um: float,
 ) -> None:
-    """
-    Generate OpenROAD Tcl script for one postCTS feature extraction run.
-    """
-
-    tcl = f"""
+    tcl = f'''
 # ============================================================
-# Auto-generated postCTS net feature extraction script
+# Auto-generated OpenROAD postCTS feature extraction script
 # ============================================================
 
-source "{config_file}"
+source "{tcl_quote(config_file)}"
 
 foreach lef $lef_list {{
     read_lef $lef
 }}
 
-read_def "{def_file}"
+read_def "{tcl_quote(def_file)}"
 
-# Create timing corner
 define_corners view
 
-# Read Liberty
 foreach lib $liberty {{
     read_liberty -corner view $lib
 }}
 
-# Set units from run config
 set_cmd_units \\
     -time $liberty_time_unit \\
     -capacitance $liberty_cap_unit \\
@@ -135,26 +676,21 @@ set_cmd_units \\
     -resistance $liberty_res_unit \\
     -distance um
 
-read_sdc "{sdc_file}"
+read_sdc "{tcl_quote(sdc_file)}"
 
-# Path groups are not strictly required for feature extraction,
-# but they initialize the timing environment similarly to the main flow.
 catch {{group_path -name reg2reg -from [all_registers] -to [all_registers]}} group_msg
 catch {{group_path -name in2reg  -from [all_inputs]    -to [all_registers]}} group_msg
 catch {{group_path -name reg2out -from [all_registers] -to [all_outputs]}} group_msg
 catch {{group_path -name in2out  -from [all_inputs]    -to [all_outputs]}} group_msg
 
-# User feature extraction script
-source "{feat_tcl}"
-
-# Optional feature extractor parameter
 set DENSITY_BIN_UM {density_bin_um}
 
-# Extract features
-extract_net_features_prects "{csv_file}"
+{FEATURE_TCL}
+
+extract_net_features_postcts "{tcl_quote(csv_file)}"
 
 exit
-"""
+'''
 
     tcl_file.write_text(tcl)
 
@@ -168,7 +704,6 @@ def convert_csv_to_parquet(csv_file: Path, parquet_file: Path, keep_csv: bool) -
 
     df = df[REQUIRED_OUTPUT_COLUMNS]
 
-    # Basic numeric coercion. This avoids object dtype for numeric columns.
     numeric_cols = [
         "fanin",
         "fanout",
@@ -193,8 +728,12 @@ def convert_csv_to_parquet(csv_file: Path, parquet_file: Path, keep_csv: bool) -
         compression="zstd",
     )
 
-    # Validate written parquet.
-    _ = pd.read_parquet(tmp_file, engine="pyarrow", columns=["design", "pdk_name", "config_id", "net_name", "pin_cap_ff"])
+    # Validate temporary parquet before replacing.
+    pd.read_parquet(
+        tmp_file,
+        engine="pyarrow",
+        columns=["design", "pdk_name", "config_id", "net_name", "pin_cap_ff"],
+    )
 
     tmp_file.replace(parquet_file)
 
@@ -208,16 +747,15 @@ def run_one(
     dataset_path: Path,
     out_dir: Path,
     run_dir: Path,
-    feat_tcl: Path,
     openroad_bin: str,
     openroad_threads: int,
     overwrite: bool,
     keep_csv: bool,
+    keep_tcl: bool,
     density_bin_um: float,
     timeout_sec: Optional[int],
 ) -> dict:
-    rel = run_dir.relative_to(dataset_path)
-    out_run_dir = out_dir / rel
+    out_run_dir = make_output_run_dir(dataset_path, out_dir, run_dir)
     out_run_dir.mkdir(parents=True, exist_ok=True)
 
     config_file = run_dir / "config" / "config.tcl"
@@ -263,16 +801,10 @@ def run_one(
         row["reason"] = "postCTS SDC not found"
         return row
 
-    if not feat_tcl.exists():
-        row["status"] = "failed"
-        row["reason"] = f"feat.tcl not found: {feat_tcl}"
-        return row
-
     make_tcl_script(
         config_file=config_file,
         def_file=def_file,
         sdc_file=sdc_file,
-        feat_tcl=feat_tcl,
         csv_file=csv_file,
         tcl_file=tcl_file,
         density_bin_um=density_bin_um,
@@ -314,6 +846,9 @@ def run_one(
             keep_csv=keep_csv,
         )
 
+        if not keep_tcl:
+            tcl_file.unlink(missing_ok=True)
+
         row["status"] = "ok"
         row["reason"] = ""
         row["num_nets"] = int(num_nets)
@@ -353,7 +888,7 @@ def write_report(report_rows: list[dict], report_path: Path) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Extract postCTS net-level features from raw OpenROAD dataset and save one parquet file per run."
+        description="Standalone postCTS net-level feature extraction from raw OpenROAD dataset."
     )
 
     parser.add_argument(
@@ -371,16 +906,9 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--feat_tcl",
-        required=True,
-        type=Path,
-        help="Path to feat.tcl containing extract_net_features_prects procedure.",
-    )
-
-    parser.add_argument(
         "--openroad_bin",
         default="openroad",
-        help="OpenROAD executable. Default: openroad",
+        help="OpenROAD executable. Default: openroad.",
     )
 
     parser.add_argument(
@@ -401,7 +929,7 @@ def parse_args() -> argparse.Namespace:
         "--density_bin_um",
         type=float,
         default=10.0,
-        help="Density bin size in microns used by feat.tcl. Default: 10.0.",
+        help="Density bin size in microns. Default: 10.0.",
     )
 
     parser.add_argument(
@@ -414,6 +942,12 @@ def parse_args() -> argparse.Namespace:
         "--keep_csv",
         action="store_true",
         help="Keep intermediate CSV files.",
+    )
+
+    parser.add_argument(
+        "--keep_tcl",
+        action="store_true",
+        help="Keep generated Tcl files.",
     )
 
     parser.add_argument(
@@ -445,14 +979,9 @@ def main() -> None:
 
     dataset_path = args.dataset_path.resolve()
     out_dir = args.out_dir.resolve()
-    feat_tcl = args.feat_tcl.resolve()
 
     if not dataset_path.exists():
         print(f"ERROR: dataset_path does not exist: {dataset_path}", file=sys.stderr)
-        sys.exit(1)
-
-    if not feat_tcl.exists():
-        print(f"ERROR: feat_tcl does not exist: {feat_tcl}", file=sys.stderr)
         sys.exit(1)
 
     run_dirs = find_run_dirs(dataset_path)
@@ -465,7 +994,6 @@ def main() -> None:
     print(f"Found runs: {len(run_dirs)}")
     print(f"Dataset path: {dataset_path}")
     print(f"Output dir: {out_dir}")
-    print(f"Feature Tcl: {feat_tcl}")
     print(f"Parallel jobs: {args.jobs}")
     print(f"OpenROAD threads per job: {args.openroad_threads}")
 
@@ -479,11 +1007,11 @@ def main() -> None:
                 dataset_path=dataset_path,
                 out_dir=out_dir,
                 run_dir=run_dir,
-                feat_tcl=feat_tcl,
                 openroad_bin=args.openroad_bin,
                 openroad_threads=args.openroad_threads,
                 overwrite=args.overwrite,
                 keep_csv=args.keep_csv,
+                keep_tcl=args.keep_tcl,
                 density_bin_um=args.density_bin_um,
                 timeout_sec=args.timeout,
             )
@@ -499,11 +1027,11 @@ def main() -> None:
                     dataset_path,
                     out_dir,
                     run_dir,
-                    feat_tcl,
                     args.openroad_bin,
                     args.openroad_threads,
                     args.overwrite,
                     args.keep_csv,
+                    args.keep_tcl,
                     args.density_bin_um,
                     args.timeout,
                 ): run_dir
@@ -513,6 +1041,7 @@ def main() -> None:
             for idx, fut in enumerate(as_completed(futures), 1):
                 row = fut.result()
                 report_rows.append(row)
+
                 print(
                     f"[{idx}/{len(run_dirs)}] "
                     f"{row['status']}: {row['run_dir']} "
@@ -528,12 +1057,17 @@ def main() -> None:
     n_ok = sum(r["status"] == "ok" for r in report_rows)
     n_failed = sum(r["status"] == "failed" for r in report_rows)
     n_skipped = sum(r["status"] == "skipped" for r in report_rows)
-    total_nets = sum(int(r["num_nets"]) for r in report_rows if str(r["num_nets"]).isdigit())
+
+    total_nets = 0
+    for r in report_rows:
+        try:
+            total_nets += int(r["num_nets"])
+        except Exception:
+            pass
 
     summary = {
         "dataset_path": str(dataset_path),
         "out_dir": str(out_dir),
-        "feat_tcl": str(feat_tcl),
         "runs_total": len(run_dirs),
         "runs_ok": n_ok,
         "runs_failed": n_failed,
@@ -542,6 +1076,7 @@ def main() -> None:
     }
 
     summary_path = out_dir / "summary.json"
+
     with summary_path.open("w") as f:
         json.dump(summary, f, indent=2)
 
