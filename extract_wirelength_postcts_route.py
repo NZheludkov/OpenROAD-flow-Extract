@@ -248,7 +248,7 @@ foreach net [ get_full_name_list [get_nets -filter "name != VDD && name != VSS"]
   	} else {
     	dict set dict_nets $net "driving_inst" "port"
     	dict set dict_nets $net "driving_cell" "port"
-    	dict set dict_nets $net "driving_cell_strength" "port"
+    	dict set dict_nets $net "driving_cell_strength" "0"
     	dict set dict_nets $net "is_inverter" "0"
     	dict set dict_nets $net "is_buffer" "0"
     	dict set dict_nets $net "fanin" "0"
