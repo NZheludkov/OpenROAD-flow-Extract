@@ -123,8 +123,8 @@ proc tcl::mathfunc::roundto {value sigfigs} {
 set db [::ord::get_db]
 set block [[$db getChip] getBlock]
 set db_units_per_micron [expr double([$block getDbUnitsPerMicron])]
-#set corner [lindex [sta::corners] 0]
-set corner "view"
+set corner [lindex [sta::corners] 0]
+#set corner "view"
 
 set block_llx [expr [[$block getBBox] xMin] / $db_units_per_micron]
 set block_lly [expr [[$block getBBox] yMin] / $db_units_per_micron]
